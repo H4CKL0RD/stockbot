@@ -1,0 +1,57 @@
+# Ignore compiled files
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Ignore build directories
+build/
+dist/
+target/
+
+# Ignore log files
+*.log
+logs/
+
+# Ignore temporary files
+*.tmp
+*.bak
+~*
+#*#
+
+# Ignore IDE and editor specific files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Ignore environment variables files
+.env
+
+# Ignore node_modules directory for Node.js projects
+node_modules/
+
+# Ignore Python specific files
+__pycache__/
+*.pyc
+
+# Ignore Ruby specific files
+.bundle/
+vendor/bundle/
+
+# Ignore Maven specific files
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# Ignore Terraform specific directories
+.terraform/
+.terraform.lock.hcl

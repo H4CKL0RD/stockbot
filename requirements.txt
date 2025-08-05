@@ -1,0 +1,5 @@
+alpaca-py
+rich
+asciichartpy
+python-dotenv
+pynput
