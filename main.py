@@ -1,20 +1,18 @@
 """
-AI-Powered Stock Trading Bot with Market Scanner & Gemini API (v7.4 - Stable API)
+AI-Powered Stock Trading Bot with Market Scanner & Gemini API (v7.9 - Logging Fix)
 
 This script implements a dynamic stock trading bot that uses Google's Gemini LLM
 for market analysis, asset selection, and trade execution decisions. It now includes
 stop-loss/take-profit orders, P/L tracking, news analysis, and manual controls.
 
-This version reverts the AI core from a broken RL model back to the reliable Gemini API.
+This version adds clearer logging for why a 'Buy' order might be skipped.
 
 Key Features:
+- Clearer Logging: Bot now explicitly states when it skips a buy order due to an existing position.
+- Command-Line Controls: Manual controls now use a '|' prefix (e.g., '|s').
 - Advanced Technical Analysis: Bot pre-calculates RSI, MACD, and Bollinger Bands for the AI.
-- AI Self-Correction: Bot remembers past trade outcomes for each stock to inform future decisions.
+- AI Self-Correction: Bot remembers past trade outcomes for each stock.
 - Dynamic Position Sizing: AI provides a "confidence score" to adjust trade size.
-- Trailing Stop-Loss Orders: Uses a more advanced stop-loss strategy to protect profits.
-- High-Resolution Data: Analyzes 5-minute historical data intervals.
-- Enhanced UI: New panel displays live technical indicators.
-- Manual Keyboard Controls: Pause (p), Sell (s), New Scan (n), and Quit (q).
 """
 
 import os
@@ -45,7 +43,6 @@ from rich.text import Text
 from rich.layout import Layout
 import asciichartpy
 from datetime import datetime, timedelta
-from pynput import keyboard
 
 # Load environment variables from .env file
 load_dotenv()
@@ -62,21 +59,23 @@ class BotState:
         self.should_exit = False
         self.session_pl = 0.0
         self.current_trading_asset = None
-        self.trade_history = defaultdict(list) # Stores trade outcomes per symbol
+        self.trade_history = defaultdict(list)
 
 bot_state = BotState()
 
-def on_press(key):
-    """Handles keyboard input for manual controls."""
-    try:
-        if key.char == 'p': bot_state.paused = not bot_state.paused; log_messages.append(f"[bold yellow]Trading {'PAUSED' if bot_state.paused else 'RESUMED'}.[/bold yellow]")
-        elif key.char == 's': bot_state.force_sell = True; log_messages.append("[bold red]Manual SELL triggered![/bold red]")
-        elif key.char == 'n': bot_state.force_scan = True; log_messages.append("[bold cyan]Manual asset scan triggered![/bold cyan]")
-        elif key.char == 'q': bot_state.should_exit = True; log_messages.append("[bold]Exit signal received. Shutting down...[/bold]")
-    except AttributeError: pass
-
-listener = keyboard.Listener(on_press=on_press)
-listener.start()
+def handle_user_input():
+    """Runs in a separate thread to handle non-blocking user input."""
+    while not bot_state.should_exit:
+        try:
+            command = input()
+            if command.startswith('|'):
+                cmd = command[1:].lower()
+                if cmd == 'p': bot_state.paused = not bot_state.paused; log_messages.append(f"[bold yellow]Trading {'PAUSED' if bot_state.paused else 'RESUMED'}.[/bold yellow]")
+                elif cmd == 's': bot_state.force_sell = True; log_messages.append("[bold red]Manual SELL triggered![/bold red]")
+                elif cmd == 'n': bot_state.force_scan = True; log_messages.append("[bold cyan]Manual asset scan triggered![/bold cyan]")
+                elif cmd == 'q': bot_state.should_exit = True; log_messages.append("[bold]Exit signal received. Shutting down...[/bold]")
+        except (EOFError, KeyboardInterrupt):
+            bot_state.should_exit = True
 
 # === Configuration & API Key Management ===
 def get_api_key(key_name: str, is_secret: bool = True) -> str:
@@ -96,12 +95,12 @@ APCA_PAPER = True
 
 # --- Trading Parameters ---
 SCAN_INTERVAL_MINUTES = 15
-TRADE_INTERVAL_SECONDS = 60
+TRADE_INTERVAL_SECONDS = 5
 MAX_HISTORY_LENGTH = 100
 PRICE_WINDOW = 20
 
 # --- Risk Management ---
-BASE_TRADE_SIZE_PERCENT = 0.50 # Base trade size for a confidence score of 5
+BASE_TRADE_SIZE_PERCENT = 0.50
 TAKE_PROFIT_PERCENT = 5.0
 TRAILING_STOP_PERCENT = 2.5
 
@@ -284,22 +283,26 @@ def execute_trade(decision, asset, buying_power, position, current_price, reason
     if decision == "Hold": return
     log_messages.append(f"Decision: [cyan]{decision} {asset_symbol}[/cyan] (Confidence: {confidence}/10).")
     try:
-        if decision == "Buy" and position is None:
-            trade_percent = BASE_TRADE_SIZE_PERCENT * (confidence / 5.0)
-            usd_to_spend = round(buying_power * trade_percent, 2)
-            if usd_to_spend < 1.0:
-                log_messages.append(f"[yellow]Skipped Buy: Trade size (${usd_to_spend:.2f}) is below minimum.[/yellow]")
-                return
-            
-            order_data = MarketOrderRequest(
-                symbol=asset_symbol, notional=usd_to_spend, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(limit_price=round(current_price * (1 + TAKE_PROFIT_PERCENT / 100), 2)),
-                stop_loss=StopLossRequest(stop_price=round(current_price * (1 - STOP_LOSS_PERCENT / 100), 2), trail_percent=TRAILING_STOP_PERCENT)
-            )
-            order = trading_client.submit_order(order_data=order_data)
-            log_trade_to_csv(time.strftime('%Y-%m-%d %H:%M:%S'), asset_symbol, "Buy", usd_to_spend, current_price, order.id, reasoning)
-            log_messages.append(f"[green]Submitted BUY bracket order for ${usd_to_spend:.2f} of {asset_symbol}.[/green]")
+        if decision == "Buy":
+            if position is None:
+                trade_percent = BASE_TRADE_SIZE_PERCENT * (confidence / 5.0)
+                usd_to_spend = round(buying_power * trade_percent, 2)
+                if usd_to_spend < 1.0:
+                    log_messages.append(f"[yellow]Skipped Buy: Trade size (${usd_to_spend:.2f}) is below minimum.[/yellow]")
+                    return
+                
+                order_data = MarketOrderRequest(
+                    symbol=asset_symbol, notional=usd_to_spend, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+                    order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=round(current_price * (1 + TAKE_PROFIT_PERCENT / 100), 2)),
+                    stop_loss=StopLossRequest(trail_percent=TRAILING_STOP_PERCENT)
+                )
+                order = trading_client.submit_order(order_data=order_data)
+                log_trade_to_csv(time.strftime('%Y-%m-%d %H:%M:%S'), asset_symbol, "Buy", usd_to_spend, current_price, order.id, reasoning)
+                log_messages.append(f"[green]Submitted BUY bracket order for ${usd_to_spend:.2f} of {asset_symbol}.[/green]")
+            else:
+                # This is the new log message
+                log_messages.append(f"[yellow]Skipped Buy: A position in {asset_symbol} already exists.[/yellow]")
         
         elif decision == "Sell" and position is not None:
             trading_client.close_position(asset_symbol)
@@ -315,14 +318,15 @@ def execute_trade(decision, asset, buying_power, position, current_price, reason
 
 # === UI Generation Functions ===
 def make_layout() -> Layout:
+    """Defines the terminal layout."""
     layout = Layout(name="root")
     layout.split(Layout(name="header", size=3), Layout(ratio=1, name="main"), Layout(size=8, name="footer"))
     layout["main"].split_row(Layout(name="side"), Layout(name="body", ratio=2))
-    layout["side"].split(Layout(name="status"), Layout(name="indicators"), Layout(name="controls", size=6))
+    layout["side"].split(Layout(name="status"), Layout(name="countdown", size=3), Layout(name="indicators"), Layout(name="controls", size=6))
     return layout
 
 def generate_header(asset_symbol) -> Panel:
-    title = "[bold magenta]AI Stock Trading Bot[/] [dim]v7.4 - Stable API[/]"
+    title = "[bold magenta]AI Stock Trading Bot[/] [dim]v7.9 - Logging Fix[/]"
     trading_info = f"[bold]{asset_symbol or 'SCANNING...'}[/] | [yellow]{'PAPER' if APCA_PAPER else 'LIVE'}[/]"
     grid = Table.grid(expand=True); grid.add_column(justify="center", ratio=1); grid.add_column(justify="right")
     grid.add_row(title, trading_info)
@@ -368,21 +372,27 @@ def generate_controls_panel() -> Panel:
     """Creates a panel to display manual controls."""
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(justify="left", style="bold"); table.add_column(justify="right")
-    table.add_row("s", "Sell Current Position"); table.add_row("p", "Pause / Resume Trading")
-    table.add_row("n", "Scan for New Asset"); table.add_row("q", "Quit Bot")
+    table.add_row("|s", "Sell Current Position")
+    table.add_row("|p", "Pause / Resume Trading")
+    table.add_row("|n", "Scan for New Asset")
+    table.add_row("|q", "Quit Bot")
     return Panel(table, title="[bold]Manual Controls[/bold]", border_style="red")
 
 def generate_chart_panel(asset_symbol) -> Panel:
     prices = list(price_history)
     title = f"[bold]{asset_symbol} Price Chart[/bold]"
     if not prices: return Panel(Text("Waiting for price data...", justify="center"), title=title, border_style="green")
-    chart_height = console.height - 3 - 8 - 4 # Adjusted for new footer size
+    chart_height = console.height - 3 - 8 - 4
     if chart_height <= 3: return Panel(Text("Terminal too small.", justify="center"), title=title, border_style="red")
     try:
         chart_content = asciichartpy.plot(prices, {'height': chart_height})
         return Panel(Text(chart_content, justify="left"), title=title, border_style="green")
     except Exception as e:
         return Panel(Text(f"Chart Error: {e}", justify="center"), title=title, border_style="red")
+
+def generate_countdown_panel(countdown) -> Panel:
+    """Creates a panel for the countdown timer."""
+    return Panel(Text(f"{countdown}s", justify="center"), title="[bold]Next Cycle In[/bold]", border_style="magenta")
 
 def generate_log_panel() -> Panel:
     return Panel(Text("\n".join(log_messages), justify="left"), title="[bold]Event Log[/bold]", border_style="yellow")
@@ -399,6 +409,9 @@ def main():
     
     show_startup_animation()
     if not initialize_api_clients(): return
+
+    input_thread = threading.Thread(target=handle_user_input, daemon=True)
+    input_thread.start()
 
     with console.status("[bold green]Scanning markets for opportunities...", spinner="dots") as status:
         assets = get_tradable_assets()
@@ -462,10 +475,14 @@ def main():
                     layout["side"]["indicators"].update(generate_indicators_panel(indicators))
                     layout["side"]["controls"].update(generate_controls_panel())
                     layout["body"].update(generate_chart_panel(asset.symbol))
-                    layout["footer"].update(generate_log_panel())
-                    live.update(layout, refresh=True)
                     
-                    time.sleep(TRADE_INTERVAL_SECONDS)
+                    # Countdown loop
+                    for i in range(TRADE_INTERVAL_SECONDS - 2, 0, -1):
+                        if bot_state.should_exit or bot_state.force_scan or bot_state.force_sell: break
+                        layout["side"]["countdown"].update(generate_countdown_panel(i))
+                        layout["footer"].update(generate_log_panel())
+                        live.update(layout, refresh=True)
+                        time.sleep(1)
 
                 except requests.exceptions.ConnectionError:
                     log_messages.append("[bold red]Network connection lost! Reconnecting...[/bold red]")
@@ -474,10 +491,9 @@ def main():
                     continue
 
         finally:
-            listener.stop()
-            console.print("\n[bold cyan]Bot stopped. Goodbye![/bold cyan]")
+            console.print("\n[bold cyan]Bot stopped. Type '|q' and press Enter to exit fully.[/bold cyan]")
 
 if __name__ == "__main__":
     # Before running, ensure you have a requirements.txt file with:
-    # alpaca-py, rich, python-dotenv, asciichartpy, requests, pynput, pandas, pandas-ta
+    # alpaca-py, rich, python-dotenv, asciichartpy, requests, pandas, pandas-ta
     main()
