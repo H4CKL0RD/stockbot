@@ -1,18 +1,19 @@
 """
-AI-Powered Stock Trading Bot with Market Scanner & Gemini API (v6.2 - Connection Fix)
+AI-Powered Stock Trading Bot with Market Scanner & Gemini API (v7.4 - Stable API)
 
 This script implements a dynamic stock trading bot that uses Google's Gemini LLM
 for market analysis, asset selection, and trade execution decisions. It now includes
 stop-loss/take-profit orders, P/L tracking, news analysis, and manual controls.
 
-This version adds a self-healing mechanism to automatically reconnect after network disruptions.
+This version reverts the AI core from a broken RL model back to the reliable Gemini API.
 
 Key Features:
-- Auto-Reconnect: Bot now survives network interruptions (like computer sleep) without crashing.
-- Stop-Loss & Take-Profit: Automatically places bracket orders to manage risk.
-- P/L Tracking: Displays real-time unrealized and session-totaled profit/loss.
-- Smarter AI Scanning: AI now analyzes and ranks the top 3 most promising assets.
-- News Sentiment Analysis: AI incorporates the latest news headlines in its decisions.
+- Advanced Technical Analysis: Bot pre-calculates RSI, MACD, and Bollinger Bands for the AI.
+- AI Self-Correction: Bot remembers past trade outcomes for each stock to inform future decisions.
+- Dynamic Position Sizing: AI provides a "confidence score" to adjust trade size.
+- Trailing Stop-Loss Orders: Uses a more advanced stop-loss strategy to protect profits.
+- High-Resolution Data: Analyzes 5-minute historical data intervals.
+- Enhanced UI: New panel displays live technical indicators.
 - Manual Keyboard Controls: Pause (p), Sell (s), New Scan (n), and Quit (q).
 """
 
@@ -24,15 +25,17 @@ import getpass
 import requests
 import random
 import threading
+import pandas as pd
+import pandas_ta as ta
 from pathlib import Path
-from collections import deque
+from collections import deque, defaultdict
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.common.exceptions import APIError
 from rich.console import Console
 from rich.panel import Panel
@@ -59,27 +62,18 @@ class BotState:
         self.should_exit = False
         self.session_pl = 0.0
         self.current_trading_asset = None
-        self.position_entry_price = 0.0
+        self.trade_history = defaultdict(list) # Stores trade outcomes per symbol
 
 bot_state = BotState()
 
 def on_press(key):
     """Handles keyboard input for manual controls."""
     try:
-        if key.char == 'p':
-            bot_state.paused = not bot_state.paused
-            log_messages.append(f"[bold yellow]Trading {'PAUSED' if bot_state.paused else 'RESUMED'} by user.[/bold yellow]")
-        elif key.char == 's':
-            bot_state.force_sell = True
-            log_messages.append("[bold red]Manual SELL triggered by user![/bold red]")
-        elif key.char == 'n':
-            bot_state.force_scan = True
-            log_messages.append("[bold cyan]Manual asset scan triggered by user![/bold cyan]")
-        elif key.char == 'q':
-            bot_state.should_exit = True
-            log_messages.append("[bold]Exit signal received. Shutting down gracefully...[/bold]")
-    except AttributeError:
-        pass
+        if key.char == 'p': bot_state.paused = not bot_state.paused; log_messages.append(f"[bold yellow]Trading {'PAUSED' if bot_state.paused else 'RESUMED'}.[/bold yellow]")
+        elif key.char == 's': bot_state.force_sell = True; log_messages.append("[bold red]Manual SELL triggered![/bold red]")
+        elif key.char == 'n': bot_state.force_scan = True; log_messages.append("[bold cyan]Manual asset scan triggered![/bold cyan]")
+        elif key.char == 'q': bot_state.should_exit = True; log_messages.append("[bold]Exit signal received. Shutting down...[/bold]")
+    except AttributeError: pass
 
 listener = keyboard.Listener(on_press=on_press)
 listener.start()
@@ -89,10 +83,8 @@ def get_api_key(key_name: str, is_secret: bool = True) -> str:
     key = os.environ.get(key_name)
     if not key:
         prompt_text = f"Enter your {key_name}: "
-        try:
-            key = getpass.getpass(prompt_text) if is_secret else input(prompt_text)
-        except (KeyboardInterrupt, EOFError):
-            console.print("[bold red]Operation cancelled.[/bold red]"); exit()
+        try: key = getpass.getpass(prompt_text) if is_secret else input(prompt_text)
+        except (KeyboardInterrupt, EOFError): console.print("[bold red]Operation cancelled.[/bold red]"); exit()
     if not key: console.print(f"[bold red]Error: {key_name} is required.[/bold red]"); exit()
     return key
 
@@ -104,24 +96,21 @@ APCA_PAPER = True
 
 # --- Trading Parameters ---
 SCAN_INTERVAL_MINUTES = 15
-TRADE_INTERVAL_SECONDS = 15
+TRADE_INTERVAL_SECONDS = 60
 MAX_HISTORY_LENGTH = 100
 PRICE_WINDOW = 20
 
 # --- Risk Management ---
-TRADE_SIZE_PERCENT = 0.90
+BASE_TRADE_SIZE_PERCENT = 0.50 # Base trade size for a confidence score of 5
 TAKE_PROFIT_PERCENT = 5.0
-STOP_LOSS_PERCENT = 2.5
+TRAILING_STOP_PERCENT = 2.5
 
 # === Data & Log Storage ===
 price_history = deque(maxlen=MAX_HISTORY_LENGTH)
 log_messages = deque(maxlen=10)
 price_fetch_failures = 0
 TRADE_LOG_FILE = Path("trades.csv")
-
-# Initialize API clients globally so they can be re-initialized in main
-trading_client = None
-stock_data_client = None
+trading_client, stock_data_client = None, None
 
 def initialize_api_clients():
     """Initializes or re-initializes the Alpaca API clients."""
@@ -129,14 +118,12 @@ def initialize_api_clients():
     try:
         trading_client = TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=APCA_PAPER)
         stock_data_client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
-        # Test connection
         trading_client.get_account()
         log_messages.append("[bold green]Successfully connected to Alpaca API.[/bold green]")
         return True
     except Exception as e:
         console.print(f"[bold red]Fatal Error: Could not connect to Alpaca API: {e}[/bold red]")
         return False
-
 
 def setup_trade_log():
     """Creates the trade log CSV file if it doesn't exist."""
@@ -202,15 +189,9 @@ def get_news(asset_symbol):
     try:
         end_time = datetime.now()
         start_time = end_time - timedelta(days=2)
-        news = stock_data_client.get_stock_news(
-            symbol_or_symbols=[asset_symbol], 
-            start=start_time, 
-            end=end_time, 
-            limit=5
-        )
+        news = stock_data_client.get_stock_news(symbol_or_symbols=[asset_symbol], start=start_time, end=end_time, limit=5)
         return [item.headline for item in news.get(asset_symbol, [])]
-    except Exception:
-        return []
+    except Exception: return []
 
 def get_account_details(asset_symbol):
     """Fetches account details and position info."""
@@ -244,27 +225,30 @@ def get_current_price(asset_symbol):
         price_fetch_failures += 1
         return list(price_history)[-1] if price_history else 0
 
-def get_historical_data(asset_symbol):
-    """Fetches the last 3 days of hourly bar data for an asset."""
+def get_historical_data_and_indicators(asset_symbol):
+    """Fetches historical data and calculates technical indicators."""
     try:
         end_time = datetime.now()
-        start_time = end_time - timedelta(days=3)
-        request_params = StockBarsRequest(
-            symbol_or_symbols=[asset_symbol],
-            timeframe=TimeFrame.Hour,
-            start=start_time,
-            end=end_time
-        )
-        bars = stock_data_client.get_stock_bars(request_params)
-        return bars.df.reset_index().to_dict('records')
+        start_time = end_time - timedelta(days=1)
+        request_params = StockBarsRequest(symbol_or_symbols=[asset_symbol], timeframe=TimeFrame(5, TimeFrameUnit.Minute), start=start_time, end=end_time)
+        bars = stock_data_client.get_stock_bars(request_params).df
+        
+        if bars.empty or len(bars) < 20: return None, None
+
+        bars.ta.rsi(length=14, append=True)
+        bars.ta.macd(fast=12, slow=26, signal=9, append=True)
+        bars.ta.bbands(length=20, std=2, append=True)
+        
+        latest_indicators = bars.iloc[-1][['RSI_14', 'MACD_12_26_9', 'MACDs_12_26_9', 'BBL_20_2.0', 'BBM_20_2.0', 'BBU_20_2.0']]
+        return bars.reset_index().to_dict('records'), latest_indicators.to_dict()
     except Exception as e:
         log_messages.append(f"[yellow]Could not fetch historical data for {asset_symbol}: {e}[/yellow]")
-        return []
+        return None, None
 
-def call_llm(asset_symbol, buying_power, position, historical_data, news_headlines):
+def call_llm(asset_symbol, buying_power, position, historical_data, indicators, news_headlines, trade_history):
     """Get trading advice from the Gemini LLM."""
     if len(price_history) < PRICE_WINDOW:
-        return "Hold", f"Waiting for {PRICE_WINDOW - len(price_history)} more data points."
+        return "Hold", f"Waiting for {PRICE_WINDOW - len(price_history)} more data points.", 5
     
     API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GOOGLE_API_KEY}"
     price_window_data = list(price_history)[-PRICE_WINDOW:]
@@ -273,13 +257,14 @@ def call_llm(asset_symbol, buying_power, position, historical_data, news_headlin
     prompt = f"""You are a data-driven financial analyst. Your goal is to maximize profit by identifying high-probability trades. Holding is a valid strategy.
 Analyze the following data for {asset_symbol}:
 - Recent Price Ticks: {json.dumps(price_summary)}
-- Historical Data (last 3 days, hourly): {json.dumps(historical_data, default=str)}
+- Technical Indicators: {json.dumps(indicators, default=str)}
 - Latest News Headlines: {json.dumps(news_headlines)}
+- Past Trade Outcomes for {asset_symbol}: {json.dumps(trade_history)}
 - My Current Position: {position.qty if position else 0} shares
 - My Buying Power: ${buying_power:,.2f}
-Your decision must be in the required JSON format.
+Your decision must be in the required JSON format, including a confidence score from 1 (low) to 10 (high).
 """
-    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "responseSchema": {"type": "OBJECT", "properties": {"decision": {"type": "STRING", "enum": ["Buy", "Sell", "Hold"]}, "reasoning": {"type": "STRING"}}, "required": ["decision", "reasoning"]}, "temperature": 0.4}}
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "responseSchema": {"type": "OBJECT", "properties": {"decision": {"type": "STRING", "enum": ["Buy", "Sell", "Hold"]}, "reasoning": {"type": "STRING"}, "confidence_score": {"type": "INTEGER"}}, "required": ["decision", "reasoning", "confidence_score"]}, "temperature": 0.4}}
 
     try:
         response = requests.post(API_URL, json=payload, timeout=20)
@@ -288,31 +273,29 @@ Your decision must be in the required JSON format.
         if 'candidates' in result and result['candidates']:
             content = result['candidates'][0]['content']['parts'][0]['text']
             llm_response = json.loads(content)
-            return llm_response.get('decision', 'Hold'), llm_response.get('reasoning', 'No reasoning.')
-        return "Hold", f"Invalid Gemini response: {result.get('promptFeedback', '')}"
+            return llm_response.get('decision', 'Hold'), llm_response.get('reasoning', 'No reasoning.'), llm_response.get('confidence_score', 5)
+        return "Hold", f"Invalid Gemini response: {result.get('promptFeedback', '')}", 5
     except Exception as e:
-        return "Hold", f"Gemini API error: {e}"
+        return "Hold", f"Gemini API error: {e}", 5
 
-def execute_trade(decision, asset, buying_power, position, current_price, reasoning):
+def execute_trade(decision, asset, buying_power, position, current_price, reasoning, confidence):
     """Executes a trade on Alpaca and logs it."""
     asset_symbol = asset.symbol
     if decision == "Hold": return
-    log_messages.append(f"Decision: [cyan]{decision} {asset_symbol}[/cyan].")
+    log_messages.append(f"Decision: [cyan]{decision} {asset_symbol}[/cyan] (Confidence: {confidence}/10).")
     try:
         if decision == "Buy" and position is None:
-            usd_to_spend = round(buying_power * TRADE_SIZE_PERCENT, 2)
+            trade_percent = BASE_TRADE_SIZE_PERCENT * (confidence / 5.0)
+            usd_to_spend = round(buying_power * trade_percent, 2)
             if usd_to_spend < 1.0:
                 log_messages.append(f"[yellow]Skipped Buy: Trade size (${usd_to_spend:.2f}) is below minimum.[/yellow]")
                 return
             
             order_data = MarketOrderRequest(
-                symbol=asset_symbol,
-                notional=usd_to_spend,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
+                symbol=asset_symbol, notional=usd_to_spend, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
                 order_class=OrderClass.BRACKET,
                 take_profit=TakeProfitRequest(limit_price=round(current_price * (1 + TAKE_PROFIT_PERCENT / 100), 2)),
-                stop_loss=StopLossRequest(stop_price=round(current_price * (1 - STOP_LOSS_PERCENT / 100), 2))
+                stop_loss=StopLossRequest(stop_price=round(current_price * (1 - STOP_LOSS_PERCENT / 100), 2), trail_percent=TRAILING_STOP_PERCENT)
             )
             order = trading_client.submit_order(order_data=order_data)
             log_trade_to_csv(time.strftime('%Y-%m-%d %H:%M:%S'), asset_symbol, "Buy", usd_to_spend, current_price, order.id, reasoning)
@@ -322,6 +305,7 @@ def execute_trade(decision, asset, buying_power, position, current_price, reason
             trading_client.close_position(asset_symbol)
             realized_pl = float(position.unrealized_pl)
             bot_state.session_pl += realized_pl
+            bot_state.trade_history[asset_symbol].append(f"Sell at ${current_price:.2f} for P/L of ${realized_pl:.2f}")
             log_messages.append(f"[red]AI initiated SELL for {position.qty} shares of {asset_symbol}. Realized P/L: ${realized_pl:,.2f}[/red]")
 
     except APIError as e:
@@ -332,12 +316,13 @@ def execute_trade(decision, asset, buying_power, position, current_price, reason
 # === UI Generation Functions ===
 def make_layout() -> Layout:
     layout = Layout(name="root")
-    layout.split(Layout(name="header", size=3), Layout(ratio=1, name="main"), Layout(size=10, name="footer"))
+    layout.split(Layout(name="header", size=3), Layout(ratio=1, name="main"), Layout(size=8, name="footer"))
     layout["main"].split_row(Layout(name="side"), Layout(name="body", ratio=2))
+    layout["side"].split(Layout(name="status"), Layout(name="indicators"), Layout(name="controls", size=6))
     return layout
 
 def generate_header(asset_symbol) -> Panel:
-    title = "[bold magenta]AI Stock Trading Bot[/] [dim]v6.2 - Connection Fix[/]"
+    title = "[bold magenta]AI Stock Trading Bot[/] [dim]v7.4 - Stable API[/]"
     trading_info = f"[bold]{asset_symbol or 'SCANNING...'}[/] | [yellow]{'PAPER' if APCA_PAPER else 'LIVE'}[/]"
     grid = Table.grid(expand=True); grid.add_column(justify="center", ratio=1); grid.add_column(justify="right")
     grid.add_row(title, trading_info)
@@ -345,7 +330,6 @@ def generate_header(asset_symbol) -> Panel:
 
 def generate_status_panel(asset_symbol, current_price, buying_power, position, decision, reasoning, equity) -> Panel:
     color = {"Buy": "green", "Sell": "red", "Hold": "yellow"}.get(decision, "white")
-    
     asset_balance = float(position.qty) if position else 0.0
     asset_value_usd = asset_balance * current_price
     unrealized_pl = float(position.unrealized_pl) if position else 0.0
@@ -360,16 +344,39 @@ def generate_status_panel(asset_symbol, current_price, buying_power, position, d
     table.add_row("[bold]Portfolio Value:[/]", f"[bold magenta]${equity:,.2f}[/]")
     table.add_row("-" * 25, "-" * 25)
     table.add_row("[bold]LLM Decision:[/]", f"[bold {color}]{decision}[/]")
-    table.add_row(Text("LLM Reasoning:", overflow="fold"), f"[italic]{reasoning}[/]")
-    table.add_row("-" * 25, "-" * 25)
+    table.add_row(Text("LLM Reasoning:", overflow="fold"), f"[italic]{reasoning}[/italic]")
     table.add_row("[bold]Status:[/]", "[bold red]PAUSED[/bold red]" if bot_state.paused else "[bold green]RUNNING[/bold green]")
     return Panel(table, title="[bold]Bot Status[/bold]", border_style="blue")
+
+def generate_indicators_panel(indicators) -> Panel:
+    """Creates a panel to display technical indicators."""
+    if not indicators:
+        return Panel(Text("Calculating...", justify="center"), title="[bold]Technical Indicators[/bold]", border_style="cyan")
+    
+    table = Table.grid(expand=True, padding=(0, 1)); table.add_column(justify="left"); table.add_column(justify="right")
+    rsi = indicators.get('RSI_14', 0)
+    rsi_color = "red" if rsi > 70 else "green" if rsi < 30 else "white"
+    table.add_row("[bold]RSI (14):[/]", f"[{rsi_color}]{rsi:.2f}[/{rsi_color}]")
+    table.add_row("[bold]MACD (12,26,9):[/]", f"{indicators.get('MACD_12_26_9', 0):.2f}")
+    table.add_row("[bold]Bollinger Lower:[/]", f"${indicators.get('BBL_20_2.0', 0):,.2f}")
+    table.add_row("[bold]Bollinger Middle:[/]", f"${indicators.get('BBM_20_2.0', 0):,.2f}")
+    table.add_row("[bold]Bollinger Upper:[/]", f"${indicators.get('BBU_20_2.0', 0):,.2f}")
+    
+    return Panel(table, title="[bold]Technical Indicators[/bold]", border_style="cyan")
+
+def generate_controls_panel() -> Panel:
+    """Creates a panel to display manual controls."""
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(justify="left", style="bold"); table.add_column(justify="right")
+    table.add_row("s", "Sell Current Position"); table.add_row("p", "Pause / Resume Trading")
+    table.add_row("n", "Scan for New Asset"); table.add_row("q", "Quit Bot")
+    return Panel(table, title="[bold]Manual Controls[/bold]", border_style="red")
 
 def generate_chart_panel(asset_symbol) -> Panel:
     prices = list(price_history)
     title = f"[bold]{asset_symbol} Price Chart[/bold]"
     if not prices: return Panel(Text("Waiting for price data...", justify="center"), title=title, border_style="green")
-    chart_height = console.height - 3 - 10 - 4
+    chart_height = console.height - 3 - 8 - 4 # Adjusted for new footer size
     if chart_height <= 3: return Panel(Text("Terminal too small.", justify="center"), title=title, border_style="red")
     try:
         chart_content = asciichartpy.plot(prices, {'height': chart_height})
@@ -378,14 +385,7 @@ def generate_chart_panel(asset_symbol) -> Panel:
         return Panel(Text(f"Chart Error: {e}", justify="center"), title=title, border_style="red")
 
 def generate_log_panel() -> Panel:
-    controls = "Controls: [bold](s)[/] Sell Position | [bold](p)[/] Pause/Resume | [bold](n)[/] New Scan | [bold](q)[/] Quit"
-    log_renderable = Text("\n".join(log_messages), justify="left")
-    
-    log_table = Table.grid(expand=True)
-    log_table.add_row(log_renderable)
-    log_table.add_row() # Spacer
-    log_table.add_row(controls)
-    return Panel(log_table, title="[bold]Event Log[/bold]", border_style="yellow")
+    return Panel(Text("\n".join(log_messages), justify="left"), title="[bold]Event Log[/bold]", border_style="yellow")
 
 def show_startup_animation():
     """Displays an ASCII art and status message on startup."""
@@ -414,20 +414,12 @@ def main():
         try:
             while not bot_state.should_exit:
                 try:
-                    # --- Handle Manual Controls ---
-                    if bot_state.force_scan:
-                        trading_client.close_all_positions(cancel_orders=True)
-                        log_messages.append("All positions closed for new scan.")
+                    # --- Handle Manual Controls & Asset Scanning ---
+                    if bot_state.force_scan or time.time() - last_scan_time > SCAN_INTERVAL_MINUTES * 60:
+                        try: trading_client.close_all_positions(cancel_orders=True)
+                        except APIError as e:
+                            if "no position to liquidate" not in str(e).lower(): raise e
                         bot_state.force_scan = False
-                        last_scan_time = 0; continue
-                    
-                    if bot_state.force_sell:
-                        trading_client.close_position(bot_state.current_trading_asset.symbol)
-                        log_messages.append(f"Position in {bot_state.current_trading_asset.symbol} closed by user.")
-                        bot_state.force_sell = False
-                    
-                    # --- Asset Scanning Loop ---
-                    if time.time() - last_scan_time > SCAN_INTERVAL_MINUTES * 60:
                         with console.status("[bold green]Scanning for new assets...", spinner="dots"):
                             assets = get_tradable_assets()
                             if assets:
@@ -436,41 +428,49 @@ def main():
                                 last_scan_time = time.time()
                             else:
                                 log_messages.append("[red]No tradable assets found. Retrying scan later.[/red]"); time.sleep(60); continue
-
+                    
+                    if bot_state.force_sell:
+                        try:
+                            trading_client.close_position(bot_state.current_trading_asset.symbol)
+                            log_messages.append(f"Position in {bot_state.current_trading_asset.symbol} closed by user.")
+                        except APIError as e:
+                            if "position not found" in str(e).lower():
+                                log_messages.append(f"[yellow]Manual sell failed: No position in {bot_state.current_trading_asset.symbol} to sell.[/yellow]")
+                            else: raise e
+                        bot_state.force_sell = False
+                    
                     # --- Trading Loop ---
                     asset = bot_state.current_trading_asset
                     current_price = get_current_price(asset.symbol)
-                    if current_price == 0 or price_fetch_failures >= 5:
-                        log_messages.append(f"[red]Price fetch failed for {asset.symbol}. Pausing.[/red]"); time.sleep(TRADE_INTERVAL_SECONDS); continue
-                    
+                    if current_price == 0: time.sleep(TRADE_INTERVAL_SECONDS); continue
                     price_history.append(current_price)
                     
                     buying_power, position, equity = get_account_details(asset.symbol)
+                    historical_data, indicators = get_historical_data_and_indicators(asset.symbol)
                     
-                    decision, reasoning = ("Hold", "Trading is paused.") if bot_state.paused else call_llm(asset.symbol, buying_power, position, get_historical_data(asset.symbol), get_news(asset.symbol))
+                    decision, reasoning, confidence = ("Hold", "Trading is paused.", 5) if bot_state.paused else call_llm(asset.symbol, buying_power, position, historical_data, indicators, get_news(asset.symbol), bot_state.trade_history[asset.symbol])
                     
                     if not bot_state.paused:
-                        execute_trade(decision, asset, buying_power, position, current_price, reasoning)
+                        execute_trade(decision, asset, buying_power, position, current_price, reasoning, confidence)
                     
                     time.sleep(2)
                     final_buying_power, final_position, final_equity = get_account_details(asset.symbol)
                     
-                    # Update UI components
+                    # Update UI
                     layout["header"].update(generate_header(asset.symbol))
-                    layout["side"].update(generate_status_panel(asset.symbol, current_price, final_buying_power, final_position, decision, reasoning, final_equity))
+                    layout["side"]["status"].update(generate_status_panel(asset.symbol, current_price, final_buying_power, final_position, decision, reasoning, final_equity))
+                    layout["side"]["indicators"].update(generate_indicators_panel(indicators))
+                    layout["side"]["controls"].update(generate_controls_panel())
                     layout["body"].update(generate_chart_panel(asset.symbol))
                     layout["footer"].update(generate_log_panel())
                     live.update(layout, refresh=True)
                     
                     time.sleep(TRADE_INTERVAL_SECONDS)
 
-                except requests.exceptions.ConnectionError as e:
-                    log_messages.append("[bold red]Network connection lost! Attempting to reconnect...[/bold red]")
-                    live.update(layout, refresh=True)
-                    time.sleep(5)
-                    if not initialize_api_clients():
-                        log_messages.append("[bold red]Reconnect failed. Please check network and restart.[/bold red]")
-                        bot_state.should_exit = True
+                except requests.exceptions.ConnectionError:
+                    log_messages.append("[bold red]Network connection lost! Reconnecting...[/bold red]")
+                    live.update(layout, refresh=True); time.sleep(5)
+                    if not initialize_api_clients(): bot_state.should_exit = True
                     continue
 
         finally:
@@ -479,5 +479,5 @@ def main():
 
 if __name__ == "__main__":
     # Before running, ensure you have a requirements.txt file with:
-    # alpaca-py, rich, python-dotenv, asciichartpy, requests, pynput
+    # alpaca-py, rich, python-dotenv, asciichartpy, requests, pynput, pandas, pandas-ta
     main()
